@@ -116,8 +116,9 @@ const PROVIDERS = {
   },
 };
 
-// Cascade order: reliable first, free attempts after
-const DEFAULT_CASCADE = ['llama4_scout', 'gemini_flash', 'qwen_free', 'qwen_coder', 'groq', 'qwen_plus', 'claude'];
+// Cascade order: Gemini Flash leads based on empirical benchmark (bench.mjs).
+// On Bitcoin tip 944950, Gemini: 67% gate-pass / 489M top score. Llama: 0%.
+const DEFAULT_CASCADE = ['gemini_flash', 'llama4_scout', 'qwen_free', 'qwen_coder', 'groq', 'qwen_plus', 'claude'];
 
 // ============ Prompt ============
 
