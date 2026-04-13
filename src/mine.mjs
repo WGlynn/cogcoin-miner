@@ -21,6 +21,7 @@
 
 import { getWords, assaySentences } from '@cogcoin/scoring';
 import { preFilterVocab } from './coglex.mjs';
+import { getBitcoinTip, watchBlocks } from './block-watcher.mjs';
 
 // ============ Config ============
 
@@ -284,7 +285,7 @@ async function generateWithCascade(words, count, cascadeOrder) {
 
 // ============ Result Persistence ============
 
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -298,18 +299,34 @@ function loadResults() {
       return JSON.parse(readFileSync(RESULTS_FILE, 'utf-8'));
     }
   } catch {}
-  return { winners: [], stats: { totalRuns: 0, totalCandidates: 0, totalPassing: 0 } };
+  return {
+    winners: [],
+    stats: { totalRuns: 0, totalCandidates: 0, totalPassing: 0 },
+    perBlock: {}, // blockHash → { runs, bestScore, bestSentence, gatePassRate }
+  };
+}
+
+// Atomic write: write to .tmp, then rename. Prevents partial-write corruption
+// if the process dies mid-write (e.g., API Death Shield scenario).
+function atomicWrite(path, data) {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, path);
 }
 
 function saveResult(winner, meta) {
   mkdirSync(RESULTS_DIR, { recursive: true });
   const data = loadResults();
+
+  const scoreStr = winner.canonicalBlend?.toString() || '0';
+  const scoreBig = BigInt(scoreStr);
+
   data.winners.push({
     timestamp: new Date().toISOString(),
     blockHash: meta.blockHash,
     domainId: meta.domainId,
     sentence: winner.sentence,
-    score: winner.canonicalBlend?.toString() || '0',
+    score: scoreStr,
     encoded: Buffer.from(winner.encodedSentenceBytes).toString('hex'),
     provider: meta.provider,
     escalated: meta.escalated,
@@ -319,7 +336,21 @@ function saveResult(winner, meta) {
   data.stats.totalRuns++;
   data.stats.totalCandidates += meta.candidates;
   data.stats.totalPassing += meta.passing;
-  writeFileSync(RESULTS_FILE, JSON.stringify(data, null, 2));
+
+  // Per-block stats
+  if (!data.perBlock) data.perBlock = {};
+  const key = `${meta.domainId}:${meta.blockHash.slice(0, 16)}`;
+  const existing = data.perBlock[key] || { runs: 0, bestScore: '0', totalCandidates: 0, totalPassing: 0 };
+  existing.runs++;
+  existing.totalCandidates += meta.candidates;
+  existing.totalPassing += meta.passing;
+  if (scoreBig > BigInt(existing.bestScore)) {
+    existing.bestScore = scoreStr;
+    existing.bestSentence = winner.sentence;
+  }
+  data.perBlock[key] = existing;
+
+  atomicWrite(RESULTS_FILE, JSON.stringify(data, null, 2));
 }
 
 // ============ Mining Loop ============
@@ -515,6 +546,40 @@ if (args[0] === '--demo') {
   console.log(`Best score: ${bestScore}`);
   console.log(`Best sentence: ${bestSentence}`);
   showStats();
+} else if (args[0] === '--tip') {
+  // Show current Bitcoin tip (useful for testing)
+  try {
+    const tip = await getBitcoinTip();
+    console.log(`Bitcoin tip: ${tip.hash}`);
+    console.log(`Height: ${tip.height}`);
+    console.log(`Source: ${tip.source}`);
+  } catch (err) {
+    console.error(`Failed to get tip: ${err.message}`);
+    process.exit(1);
+  }
+} else if (args[0] === '--watch') {
+  // Continuous mining: watch Bitcoin blocks, mine each new one
+  const domainId = parseInt(args[1] || '1');
+  console.log(`\n=== WATCH MODE: mining each new Bitcoin block for domain ${domainId} ===\n`);
+
+  let blocksMined = 0;
+  const stop = watchBlocks(async (tip) => {
+    blocksMined++;
+    console.log(`\n[${new Date().toISOString()}] New block detected: ${tip.hash.slice(0, 16)}... (height ${tip.height})`);
+    try {
+      await mine(domainId, tip.hash);
+    } catch (err) {
+      console.error(`Mining error: ${err.message}`);
+    }
+  });
+
+  // Graceful shutdown
+  process.on('SIGINT', () => {
+    console.log(`\nShutting down. Mined ${blocksMined} blocks this session.`);
+    stop();
+    showStats();
+    process.exit(0);
+  });
 } else if (args.length >= 2) {
   const domainId = parseInt(args[0]);
   const blockHash = args[1];
@@ -526,6 +591,8 @@ if (args[0] === '--demo') {
   console.log('  node src/mine.mjs <domainId> <blockHash>   Mine a specific block');
   console.log('  node src/mine.mjs --demo                   Demo with test block');
   console.log('  node src/mine.mjs --grind [dom] [hash] [n] Grind n rounds on same block');
+  console.log('  node src/mine.mjs --watch [domainId]       Watch Bitcoin, mine each new block');
+  console.log('  node src/mine.mjs --tip                    Show current Bitcoin tip');
   console.log('  node src/mine.mjs --stats                  Show mining stats');
   console.log('');
   console.log('API Keys (set at least one):');
