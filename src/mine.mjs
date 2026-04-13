@@ -20,6 +20,7 @@
  */
 
 import { getWords, assaySentences } from '@cogcoin/scoring';
+import { preFilterVocab } from './coglex.mjs';
 
 // ============ Config ============
 
@@ -154,61 +155,86 @@ ${count} sentences, one per line:`;
 
 // ============ Provider Calls ============
 
+async function withRetry(fn, { retries = 2, baseDelayMs = 1000 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      // Only retry on rate limits or transient errors — not auth/bad-request
+      const msg = err.message || '';
+      const is429 = msg.startsWith('429');
+      const is5xx = /^5\d\d/.test(msg);
+      const isTimeout = msg.includes('aborted') || msg.includes('timeout');
+      const retryable = is429 || is5xx || isTimeout;
+
+      if (!retryable || attempt === retries) throw err;
+
+      // Exponential backoff: 1s, 2s, 4s...
+      const delay = baseDelayMs * Math.pow(2, attempt);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
 async function callOpenAICompatible(provider, words, count) {
   const key = process.env[provider.keyEnv];
   if (!key) return null;
 
-  const resp = await fetch(`${provider.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: provider.headers(key),
-    body: JSON.stringify({
-      model: provider.model,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: buildUserPrompt(words, count) },
-      ],
-      max_tokens: 2000,
-      temperature: 0.9,
-    }),
-    signal: AbortSignal.timeout(30000),
+  return withRetry(async () => {
+    const resp = await fetch(`${provider.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: provider.headers(key),
+      body: JSON.stringify({
+        model: provider.model,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: buildUserPrompt(words, count) },
+        ],
+        max_tokens: 2000,
+        temperature: 0.9,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`${resp.status} ${body.slice(0, 200)}`);
+    }
+
+    const data = await resp.json();
+    return data.choices?.[0]?.message?.content || '';
   });
-
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`${resp.status} ${body.slice(0, 200)}`);
-  }
-
-  const data = await resp.json();
-  return data.choices?.[0]?.message?.content || '';
 }
 
 async function callAnthropic(provider, words, count) {
   const key = process.env[provider.keyEnv];
   if (!key) return null;
 
-  const resp = await fetch(`${provider.baseUrl}/messages`, {
-    method: 'POST',
-    headers: {
-      'x-api-key': key,
-      'content-type': 'application/json',
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: provider.model,
-      max_tokens: 2000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: buildUserPrompt(words, count) }],
-    }),
-    signal: AbortSignal.timeout(30000),
+  return withRetry(async () => {
+    const resp = await fetch(`${provider.baseUrl}/messages`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': key,
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: provider.model,
+        max_tokens: 2000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: buildUserPrompt(words, count) }],
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`${resp.status} ${body.slice(0, 200)}`);
+    }
+
+    const data = await resp.json();
+    return data.content?.[0]?.text || '';
   });
-
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`${resp.status} ${body.slice(0, 200)}`);
-  }
-
-  const data = await resp.json();
-  return data.content?.[0]?.text || '';
 }
 
 async function callProvider(providerId, words, count) {
@@ -362,6 +388,16 @@ async function mine(domainId, blockHash) {
 
   allCandidates = [...new Set(allCandidates)];
   console.log(`After dedup: ${allCandidates.length}`);
+
+  // Coglex pre-filter: reject sentences with obviously-out-of-vocab words
+  // before expensive 256-scorer blend. Cheap CPU filter.
+  const { passing: vocabOk, rejected: vocabRejected } = preFilterVocab(allCandidates);
+  console.log(`After Coglex pre-filter: ${vocabOk.length} (rejected ${vocabRejected.length} for out-of-vocab words)`);
+  if (vocabOk.length === 0) {
+    console.error('No candidates survived Coglex pre-filter.');
+    return null;
+  }
+  allCandidates = vocabOk;
 
   console.log('Scoring via 256-scorer blend...\n');
   const results = await assaySentences(domainId, blockHash, allCandidates);
