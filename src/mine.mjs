@@ -386,29 +386,41 @@ async function mine(domainId, blockHash) {
   let usedProvider = null;
   let escalated = false;
 
-  for (let batch = 0; batch < BATCHES; batch++) {
-    console.log(`Batch ${batch + 1}/${BATCHES}:`);
-    const { providerId, sentences } = await generateWithCascade(words, CANDIDATES_PER_BATCH, cascadeOrder);
+  // Batch 1 first (so we can escalate if needed), then 2+ in parallel
+  console.log(`Batch 1/${BATCHES}:`);
+  const first = await generateWithCascade(words, CANDIDATES_PER_BATCH, cascadeOrder);
+  if (first.providerId) usedProvider = first.providerId;
+  allCandidates.push(...first.sentences);
 
-    if (providerId) {
-      usedProvider = providerId;
-    }
-    allCandidates.push(...sentences);
+  // Wardenclyffe escalation check: quick assay on first batch.
+  // If gate-pass rate on ANY tier < 50%, escalate to Claude (Tier 2) for
+  // remaining batches. Previously only triggered on Tier 0 — fixed (CM-014).
+  if (first.sentences.length > 0) {
+    const quickAssay = await assaySentences(domainId, blockHash, first.sentences.slice(0, 5));
+    const passRate = quickAssay.filter(r => r.gatesPass).length / quickAssay.length;
+    const currentTier = PROVIDERS[usedProvider]?.tier ?? 99;
 
-    // Wardenclyffe escalation check after first batch:
-    // If gate-pass rate < 50% on a T0 provider, escalate to T2
-    if (batch === 0 && sentences.length > 0 && PROVIDERS[usedProvider]?.tier === 0) {
-      const quickAssay = await assaySentences(domainId, blockHash, sentences.slice(0, 5));
-      const passRate = quickAssay.filter(r => r.gatesPass).length / quickAssay.length;
-      if (passRate < 0.5) {
-        console.log(`  ⚠ Gate-pass rate ${(passRate * 100).toFixed(0)}% — escalating to T2`);
-        // Move Claude to front of per-run cascade (not module-level)
-        const claudeIdx = cascadeOrder.indexOf('claude');
-        if (claudeIdx > 0 && process.env[PROVIDERS.claude.keyEnv]) {
-          cascadeOrder = ['claude', ...cascadeOrder.filter(id => id !== 'claude')];
-          escalated = true;
-        }
+    if (passRate < 0.5 && currentTier < 2) {
+      console.log(`  ⚠ Gate-pass rate ${(passRate * 100).toFixed(0)}% on ${PROVIDERS[usedProvider]?.name} — escalating to T2`);
+      const claudeIdx = cascadeOrder.indexOf('claude');
+      if (claudeIdx > 0 && process.env[PROVIDERS.claude.keyEnv]) {
+        cascadeOrder = ['claude', ...cascadeOrder.filter(id => id !== 'claude')];
+        escalated = true;
       }
+    }
+  }
+
+  // Remaining batches in parallel (3x speedup vs sequential)
+  if (BATCHES > 1) {
+    console.log(`Batches 2-${BATCHES} (parallel):`);
+    const parallelBatches = [];
+    for (let i = 1; i < BATCHES; i++) {
+      parallelBatches.push(generateWithCascade(words, CANDIDATES_PER_BATCH, cascadeOrder));
+    }
+    const results = await Promise.all(parallelBatches);
+    for (const r of results) {
+      if (r.providerId && !usedProvider) usedProvider = r.providerId;
+      allCandidates.push(...r.sentences);
     }
   }
 
