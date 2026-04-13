@@ -53,11 +53,25 @@ export function isInVocab(word) {
   // Try stripping common suffixes (morphological rules allow composition)
   const suffixes = ['s', 'es', 'ed', 'ing', 'er', 'est', 'ly', 'ies', 'ied'];
   for (const suf of suffixes) {
-    if (lower.endsWith(suf)) {
-      const stem = lower.slice(0, -suf.length);
-      if (stem.length >= 3 && _vocabSet.has(stem)) return true;
-      // Handle -ies → -y, -ied → -y
-      if ((suf === 'ies' || suf === 'ied') && _vocabSet.has(stem + 'y')) return true;
+    if (!lower.endsWith(suf)) continue;
+
+    const stem = lower.slice(0, -suf.length);
+    if (stem.length < 3) continue;
+
+    // Plain stem
+    if (_vocabSet.has(stem)) return true;
+
+    // -ing / -ed often drop trailing 'e' from the stem (bake → baking, wrestle → wrestling)
+    if ((suf === 'ing' || suf === 'ed' || suf === 'er' || suf === 'est') && _vocabSet.has(stem + 'e')) return true;
+
+    // -ies → -y / -ied → -y (try → tries/tried)
+    if ((suf === 'ies' || suf === 'ied') && _vocabSet.has(stem + 'y')) return true;
+
+    // Doubled-consonant forms: running → run, bigger → big
+    if ((suf === 'ing' || suf === 'ed' || suf === 'er' || suf === 'est') && stem.length >= 3) {
+      const last = stem[stem.length - 1];
+      const prevLast = stem[stem.length - 2];
+      if (last === prevLast && _vocabSet.has(stem.slice(0, -1))) return true;
     }
   }
   return false;

@@ -8,7 +8,9 @@
     "mine": "node src/mine.mjs",
     "demo": "node src/mine.mjs --demo",
     "grind": "node src/mine.mjs --grind",
-    "stats": "node src/mine.mjs --stats"
+    "watch": "node src/mine.mjs --watch",
+    "stats": "node src/mine.mjs --stats",
+    "test": "node --test test/coglex.test.mjs test/block-watcher.test.mjs"
   },
   "engines": {
     "node": ">=22.0.0"
